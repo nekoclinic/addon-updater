@@ -23,6 +23,8 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from datetime import datetime, timedelta
@@ -53,6 +55,7 @@ _settings = dict(_DEFAULTS)
 _state = {
     "busy": False,
     "notify_after_fetch": False,
+    "show_restart_prompt": False,
     "message": "",
     "releases": [],      # [{tag, version, url, name, prerelease}]
     "need_restart": False,
@@ -139,11 +142,61 @@ def _cmp_ver(a, b):
 
 
 def _headers():
-    h = {"User-Agent": f"{PKG}-updater", "Accept": "application/vnd.github+json"}
+    h = {
+        "User-Agent": f"{PKG}-updater",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
     token = _token()
     if token:
         h["Authorization"] = f"Bearer {token}"
     return h
+
+
+def _format_error(error):
+    if isinstance(error, PermissionError):
+        path = error.filename or ""
+        message = f"{error}"
+        if getattr(error, "winerror", None) == 5 or error.errno == 5:
+            message += (
+                " | アドオンフォルダへのアクセスが拒否されました。"
+                "Blenderを管理者として実行するか、書き込み可能なユーザー領域へ"
+                "アドオンをインストールしてください"
+            )
+        if path:
+            message += f" [対象: {path}]"
+        return message
+    if isinstance(error, urllib.error.HTTPError):
+        detail = ""
+        try:
+            payload = json.loads(error.read().decode("utf-8"))
+            detail = payload.get("message", "")
+        except (OSError, UnicodeDecodeError, ValueError, AttributeError):
+            pass
+        message = f"HTTP {error.code} {error.reason}"
+        if detail:
+            message += f" ({detail})"
+        message += f": {error.url}"
+        if (
+            error.code == 404
+            and "api.github.com/repos/" in error.url
+            and GITHUB_REPO.lower() in error.url.lower()
+        ):
+            if _token():
+                message += (
+                    " | GITHUB_TOKENは設定済みですが、GitHubがリポジトリを"
+                    "参照できていません。Fine-grained tokenなら対象リポジトリを"
+                    "Repository accessに追加し、Contents: Readを許可してください。"
+                    "Classic tokenならrepoスコープが必要です。期限切れや"
+                    "Organizationの承認待ちも確認してください"
+                )
+            else:
+                message += (
+                    " | 非公開リポジトリを読むGITHUB_TOKENがありません。"
+                    "アドオン直下の.envに設定してください"
+                )
+        return message
+    return str(error)
 
 
 def _redraw():
@@ -155,13 +208,10 @@ def _redraw():
 
 def _rebuild_enum():
     global _enum_items
-    cur = current_version()
     items = []
     for r in _state["releases"]:
-        c = _cmp_ver(r["version"], cur)
-        mark = "現在" if c == 0 else ("新しい" if c > 0 else "旧")
         pre = " [pre]" if r["prerelease"] else ""
-        items.append((r["tag"], f'{r["tag"]}{pre}  ({mark})', r["name"] or ""))
+        items.append((r["tag"], f'{r["tag"]}{pre}', r["name"] or ""))
     _enum_items = items or [("NONE", "(リリースなし)", "")]
     wm = bpy.context.window_manager
     if wm.gh_updater_tag not in [i[0] for i in _enum_items]:
@@ -215,6 +265,15 @@ def _poll():
         return 0.3
     _rebuild_enum()
     _redraw()
+    if _state["show_restart_prompt"]:
+        _state["show_restart_prompt"] = False
+        wm = bpy.context.window_manager
+        if wm.windows:
+            try:
+                with bpy.context.temp_override(window=wm.windows[0]):
+                    bpy.ops.ghupd.restart_prompt("INVOKE_DEFAULT")
+            except Exception as e:
+                _state["message"] = f"終了確認ポップアップ失敗: {e}"
     if _state["notify_after_fetch"]:
         _state["notify_after_fetch"] = False
         _maybe_notify()
@@ -242,19 +301,32 @@ def _fetch_worker(include_pre):
             ver = parse_version(rel.get("tag_name", ""))
             if ver is None:
                 continue
-            dl = None
-            for a in rel.get("assets", []):
-                if a["name"].lower().endswith(".zip"):
-                    dl = a["url"] if _token() else a["browser_download_url"]
-                    break
-            if not dl:
-                dl = rel.get("zipball_url")
-            if not dl:
+            zip_asset = next(
+                (
+                    asset for asset in rel.get("assets", [])
+                    if asset["name"].lower().endswith(".zip")
+                ),
+                None,
+            )
+            browser_url = (
+                zip_asset.get("browser_download_url") if zip_asset else None
+            )
+            asset_api_url = zip_asset.get("url") if zip_asset else None
+            download_url = (
+                (asset_api_url if _token() else browser_url)
+                or browser_url
+                or asset_api_url
+            ) or (
+                f"https://github.com/{GITHUB_REPO}/archive/refs/tags/"
+                f"{urllib.parse.quote(rel['tag_name'], safe='')}.zip"
+            )
+            if not download_url:
                 continue
             releases.append({
                 "tag": rel["tag_name"],
                 "version": ver,
-                "url": dl,
+                "url": download_url,
+                "browser_url": browser_url,
                 "name": rel.get("name", ""),
                 "prerelease": bool(rel.get("prerelease")),
             })
@@ -264,7 +336,7 @@ def _fetch_worker(include_pre):
         _settings["last_check"] = time.time()
         _save_settings()
     except Exception as e:
-        _state["message"] = f"取得失敗: {e}"
+        _state["message"] = f"取得失敗: {_format_error(e)}"
         _state["notify_after_fetch"] = False
     finally:
         _state["busy"] = False
@@ -283,19 +355,106 @@ def _find_addon_root(path):
     return None
 
 
+def _replace_addon_tree(source):
+    parent = os.path.dirname(ADDON_DIR)
+    staging_root = tempfile.mkdtemp(prefix=".gh_updater_", dir=parent)
+    staged_addon = os.path.join(staging_root, os.path.basename(ADDON_DIR))
+    backup = os.path.join(staging_root, "previous")
+    moved_old_addon = False
+    installed_new_addon = False
+    preserve_backup = False
+    cleanup_warning = ""
+    try:
+        shutil.copytree(
+            source,
+            staged_addon,
+            ignore=shutil.ignore_patterns(".env", "__pycache__"),
+        )
+        env_path = os.path.join(ADDON_DIR, ".env")
+        if os.path.isfile(env_path):
+            shutil.copy2(env_path, os.path.join(staged_addon, ".env"))
+
+        os.replace(ADDON_DIR, backup)
+        moved_old_addon = True
+        try:
+            os.replace(staged_addon, ADDON_DIR)
+            installed_new_addon = True
+        except OSError as install_error:
+            try:
+                os.replace(backup, ADDON_DIR)
+                moved_old_addon = False
+            except OSError as rollback_error:
+                raise RuntimeError(
+                    f"新バージョンの配置に失敗し、旧版の復元にも失敗しました。"
+                    f"旧版: {backup} / 配置エラー: {install_error} / "
+                    f"復元エラー: {rollback_error}"
+                ) from rollback_error
+            raise
+    finally:
+        if moved_old_addon and not installed_new_addon:
+            if not os.path.exists(ADDON_DIR):
+                try:
+                    os.replace(backup, ADDON_DIR)
+                except OSError as rollback_error:
+                    preserve_backup = True
+                    cleanup_warning = (
+                        f"旧版を自動復元できませんでした。バックアップ: {backup} / "
+                        f"{_format_error(rollback_error)}"
+                    )
+            else:
+                preserve_backup = True
+                cleanup_warning = (
+                    f"旧版バックアップを保持しました: {backup}"
+                )
+        if not preserve_backup:
+            try:
+                shutil.rmtree(staging_root)
+            except OSError as cleanup_error:
+                if installed_new_addon:
+                    cleanup_warning = (
+                        f"旧版バックアップを削除できませんでした: "
+                        f"{staging_root} / {_format_error(cleanup_error)}"
+                    )
+                elif not cleanup_warning:
+                    cleanup_warning = (
+                        f"一時ファイルを削除できませんでした: "
+                        f"{staging_root} / {_format_error(cleanup_error)}"
+                    )
+    return cleanup_warning
+
+
+def _download_release(release, zip_path):
+    download_url = release["url"]
+    headers = {"User-Agent": f"{PKG}-updater"}
+    if _token():
+        headers["Authorization"] = _headers()["Authorization"]
+    if "api.github.com" in download_url:
+        headers["Accept"] = "application/octet-stream"
+        headers["X-GitHub-Api-Version"] = "2022-11-28"
+    req = urllib.request.Request(download_url, headers=headers)
+    try:
+        response = urllib.request.urlopen(req, timeout=60)
+    except urllib.error.HTTPError as e:
+        fallback_url = release.get("browser_url")
+        if e.code != 415 or not fallback_url or fallback_url == download_url:
+            raise
+        e.close()
+        response = urllib.request.urlopen(
+            urllib.request.Request(
+                fallback_url, headers={"User-Agent": f"{PKG}-updater"}
+            ),
+            timeout=60,
+        )
+    with response, open(zip_path, "wb") as f:
+        shutil.copyfileobj(response, f)
+
+
 def _install_worker(release):
     tmp = tempfile.mkdtemp(prefix="gh_updater_")
-    backup = os.path.join(tmp, "backup")
-    replaced = False
     try:
         # ダウンロード
         zip_path = os.path.join(tmp, "pkg.zip")
-        headers = _headers()
-        if _token() and "api.github.com" in release["url"]:
-            headers["Accept"] = "application/octet-stream"
-        req = urllib.request.Request(release["url"], headers=headers)
-        with urllib.request.urlopen(req, timeout=60) as res, open(zip_path, "wb") as f:
-            shutil.copyfileobj(res, f)
+        _download_release(release, zip_path)
 
         # 展開
         ext = os.path.join(tmp, "extract")
@@ -305,29 +464,15 @@ def _install_worker(release):
         if not src:
             raise RuntimeError("zip内にアドオン(__init__.py + bl_info)が見つかりません")
 
-        # バックアップ → 入れ替え (失敗したらロールバック)
-        shutil.copytree(ADDON_DIR, backup)
-        replaced = True
-        for name in os.listdir(ADDON_DIR):
-            p = os.path.join(ADDON_DIR, name)
-            if name in ("__pycache__", ".env"):
-                continue
-            if os.path.isdir(p):
-                shutil.rmtree(p)
-            else:
-                os.remove(p)
-        shutil.copytree(src, ADDON_DIR, dirs_exist_ok=True,
-                        ignore=shutil.ignore_patterns(".env"))
+        cleanup_warning = _replace_addon_tree(src)
 
         _state["need_restart"] = True
+        _state["show_restart_prompt"] = True
         _state["message"] = f'{release["tag"]} をインストールしました'
+        if cleanup_warning:
+            _state["message"] += f" ({cleanup_warning})"
     except Exception as e:
-        if replaced and os.path.isdir(backup):
-            try:
-                shutil.copytree(backup, ADDON_DIR, dirs_exist_ok=True)
-            except Exception:
-                pass
-        _state["message"] = f"インストール失敗(ロールバック済): {e}"
+        _state["message"] = f"インストール失敗: {_format_error(e)}"
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
         _state["busy"] = False
@@ -391,7 +536,7 @@ class GHUPD_OT_install(bpy.types.Operator):
 
 
 class GHUPD_OT_popup(bpy.types.Operator):
-    """新しいバージョンがあるときに出すポップアップ"""
+    """更新があるときに出すポップアップ"""
     bl_idname = "ghupd.popup"
     bl_label = "アップデートがあります"
     bl_options = {"INTERNAL"}
@@ -411,7 +556,7 @@ class GHUPD_OT_popup(bpy.types.Operator):
             col.label(text="最新です")
             return
         pre = " (プレリリース)" if rel["prerelease"] else ""
-        col.label(text=f'新しいバージョン: {rel["tag"]}{pre}')
+        col.label(text=f'利用可能なバージョン: {rel["tag"]}{pre}')
         col.label(text=f"現在のバージョン: v{_fmt(current_version())}")
         col.label(text="「アップデート」で今すぐインストールします")
 
@@ -422,44 +567,85 @@ class GHUPD_OT_popup(bpy.types.Operator):
         return {"FINISHED"} if _start_install(rel) else {"CANCELLED"}
 
 
+class GHUPD_OT_restart_prompt(bpy.types.Operator):
+    bl_idname = "ghupd.restart_prompt"
+    bl_label = "アップデートを適用"
+    bl_options = {"INTERNAL"}
+
+    def invoke(self, context, event):
+        try:
+            return context.window_manager.invoke_props_dialog(
+                self,
+                width=360,
+                title="インストール完了",
+                confirm_text="Blenderを終了",
+            )
+        except TypeError:
+            return context.window_manager.invoke_props_dialog(self, width=360)
+
+    def draw(self, context):
+        self.layout.label(text="アップデートを適用するにはBlenderの再起動が必要です。")
+        self.layout.label(text="作業を保存してからBlenderを終了してください。")
+
+    def execute(self, context):
+        bpy.ops.wm.quit_blender()
+        return {"FINISHED"}
+
+
 # ---------------------------------------------------------------- UI
 def draw(layout, context):
     wm = context.window_manager
     box = layout.box()
-    box.label(text=f"アップデーター  (現在: v{_fmt(current_version())})", icon="URL")
+    box.label(text="Blender Updater", icon="URL")
+    box.label(text=f"現在のバージョン: v{_fmt(current_version())}")
 
-    col = box.column(align=True)
-    col.label(text="通知間隔 (すべて0なら確認のたびに通知)")
-    row = col.row(align=True)
-    row.prop(wm, "gh_updater_months")
-    row.prop(wm, "gh_updater_days")
-    row.prop(wm, "gh_updater_hours")
-    row.prop(wm, "gh_updater_minutes")
-    row.prop(wm, "gh_updater_seconds")
-    col.prop(wm, "gh_updater_pre")
+    settings_box = box.box()
+    settings_box.label(text="設定", icon="PREFERENCES")
+    settings_box.prop(wm, "gh_updater_pre")
+    settings_box.label(text="通知間隔 (すべて0の場合は毎回通知)")
+    grid = settings_box.grid_flow(
+        row_major=True, columns=3, even_columns=True, even_rows=True
+    )
+    grid.prop(wm, "gh_updater_months")
+    grid.prop(wm, "gh_updater_days")
+    grid.prop(wm, "gh_updater_hours")
+    grid.prop(wm, "gh_updater_minutes")
+    grid.prop(wm, "gh_updater_seconds")
 
     last = _settings["last_check"]
     if last:
-        box.label(text="最終確認: " + datetime.fromtimestamp(last).strftime("%Y-%m-%d %H:%M"))
+        checked_at = datetime.fromtimestamp(last).strftime("%Y-%m-%d %H:%M:%S")
+        box.label(text=f"最終確認: {checked_at}")
 
     row = box.row()
     row.enabled = not _state["busy"]
-    row.operator("ghupd.check", icon="FILE_REFRESH")
+    row.operator("ghupd.check", text="更新を確認", icon="FILE_REFRESH")
 
     if _state["releases"]:
-        box.prop(wm, "gh_updater_tag", text="バージョン")
+        version_box = box.box()
+        version_box.label(text="インストールするバージョン")
+        version_box.prop(wm, "gh_updater_tag", text="")
         row = box.row()
         row.enabled = not _state["busy"]
-        row.operator("ghupd.install", icon="IMPORT")
+        row.operator(
+            "ghupd.install",
+            text="選択したバージョンをインストール",
+            icon="IMPORT",
+        )
 
     if _state["message"]:
         box.label(text=_state["message"])
     if _state["need_restart"]:
-        box.label(text="反映するにはBlenderを再起動してください", icon="ERROR")
+        box.label(text="変更の反映にはBlenderの再起動が必要です", icon="ERROR")
 
 
 # ---------------------------------------------------------------- 登録
-_classes = (GHUPD_OT_check, GHUPD_OT_install, GHUPD_OT_popup)
+_classes = (
+    GHUPD_OT_check,
+    GHUPD_OT_install,
+    GHUPD_OT_popup,
+    GHUPD_OT_restart_prompt,
+)
 
 
 def register():
