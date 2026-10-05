@@ -16,7 +16,7 @@ bl_info = {
     "author": "wawawa",
     "description": "",
     "blender": (2, 80, 0),
-    "version": (0, 0, 8),
+    "version": (1, 0, 0),
     "location": "",
     "warning": "",
     "category": "Generic",
