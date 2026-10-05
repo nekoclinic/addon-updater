@@ -42,6 +42,7 @@ _state = {
     "busy": False,
     "notify_after_fetch": False,
     "show_restart_prompt": False,
+    "prompt_window": None,
     "message": "",
     "releases": [],      # リリース
     "need_restart": False,
@@ -250,14 +251,50 @@ def _poll():
     _rebuild_enum()
     _redraw()
     if _state["show_restart_prompt"]:
-        _state["show_restart_prompt"] = False
         wm = bpy.context.window_manager
-        if wm.windows:
-            try:
-                with bpy.context.temp_override(window=wm.windows[0]):
-                    bpy.ops.ghupd.restart_prompt("INVOKE_DEFAULT")
-            except Exception as e:
-                _state["message"] = f"Quit confirmation failed: {e}"
+        preferred_window = _state["prompt_window"]
+        active_window = bpy.context.window
+        windows = list(wm.windows)
+        ordered_windows = []
+        for win in (preferred_window, active_window, *windows):
+            if win is not None and win in windows and win not in ordered_windows:
+                ordered_windows.append(win)
+
+        popup_opened = False
+        last_error = None
+        for win in ordered_windows:
+            for area in win.screen.areas:
+                region = next(
+                    (item for item in area.regions if item.type == "WINDOW"),
+                    None,
+                )
+                if region is None:
+                    continue
+                try:
+                    with bpy.context.temp_override(
+                        window=win,
+                        area=area,
+                        region=region,
+                    ):
+                        result = bpy.ops.ghupd.restart_prompt("INVOKE_DEFAULT")
+                    if "RUNNING_MODAL" in result:
+                        popup_opened = True
+                        break
+                except Exception as e:
+                    last_error = e
+            if popup_opened:
+                break
+        if popup_opened:
+            _state["show_restart_prompt"] = False
+            _state["prompt_window"] = None
+        elif last_error:
+            _state["message"] = f"Quit confirmation failed: {last_error}"
+            _state["show_restart_prompt"] = False
+        elif not wm.windows:
+            return 0.3
+        else:
+            _state["message"] = "Could not open the quit confirmation popup"
+            _state["show_restart_prompt"] = False
     if _state["notify_after_fetch"]:
         _state["notify_after_fetch"] = False
         _maybe_notify()
@@ -475,11 +512,12 @@ def _start_fetch(notify_after_fetch=False):
     return True
 
 
-def _start_install(release):
+def _start_install(release, window=None):
     if _state["busy"]:
         return False
     _state["busy"] = True
     _state["notify_after_fetch"] = False
+    _state["prompt_window"] = window or bpy.context.window
     _state["message"] = f'Downloading {release["tag"]}...'
     threading.Thread(target=_install_worker, args=(release,), daemon=True).start()
     bpy.app.timers.register(_poll, first_interval=0.3)
@@ -516,7 +554,7 @@ class GHUPD_OT_install(bpy.types.Operator):
         rel = self._target(context)
         if not rel:
             return {"CANCELLED"}
-        return {"FINISHED"} if _start_install(rel) else {"CANCELLED"}
+        return {"FINISHED"} if _start_install(rel, context.window) else {"CANCELLED"}
 
 
 class GHUPD_OT_popup(bpy.types.Operator):
@@ -547,7 +585,7 @@ class GHUPD_OT_popup(bpy.types.Operator):
         rel = _latest_newer()
         if not rel:
             return {"CANCELLED"}
-        return {"FINISHED"} if _start_install(rel) else {"CANCELLED"}
+        return {"FINISHED"} if _start_install(rel, context.window) else {"CANCELLED"}
 
 
 class GHUPD_OT_restart_prompt(bpy.types.Operator):
@@ -557,22 +595,21 @@ class GHUPD_OT_restart_prompt(bpy.types.Operator):
 
     def invoke(self, context, event):
         try:
+            return context.window_manager.invoke_popup(self, width=360)
+        except (RuntimeError, TypeError):
             return context.window_manager.invoke_props_dialog(
-                self,
-                width=360,
-                title="Update Installed",
-                confirm_text="Quit Blender",
+                self, width=360, title="Update Installed"
             )
-        except TypeError:
-            return context.window_manager.invoke_props_dialog(self, width=360)
 
     def draw(self, context):
         self.layout.label(text="Restart Blender to apply the update.")
         self.layout.label(text="Save your work before quitting.")
+        quit_row = self.layout.row()
+        quit_row.alert = True
+        quit_row.operator("wm.quit_blender", text="Quit Blender", icon="QUIT")
 
     def execute(self, context):
-        bpy.ops.wm.quit_blender()
-        return {"FINISHED"}
+        return {"CANCELLED"}
 
 
 # ---------------------------------------------------------------- UI
