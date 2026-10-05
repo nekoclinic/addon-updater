@@ -16,7 +16,7 @@ bl_info = {
     "author": "wawawa",
     "description": "",
     "blender": (2, 80, 0),
-    "version": (0, 0, 7),
+    "version": (0, 0, 8),
     "location": "",
     "warning": "",
     "category": "Generic",
@@ -25,15 +25,18 @@ bl_info = {
 import bpy
 from . import updater
 
+
 class BUPreferences(bpy.types.AddonPreferences):
     bl_idname = __package__
 
     def draw(self, context):
         updater.draw(self.layout, context)
 
+
 def register():
     updater.register()
     bpy.utils.register_class(BUPreferences)
+
 
 def unregister():
     updater.unregister()

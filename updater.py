@@ -1,5 +1,3 @@
-# GitHub Releasesを使うBlenderアドオン更新機能。
-
 import calendar
 import json
 import os
@@ -124,10 +122,7 @@ def _format_error(error):
         path = error.filename or ""
         message = f"{error}"
         if getattr(error, "winerror", None) == 5 or error.errno == 5:
-            message += (
-                " | Access denied to the add-on folder. Run Blender as administrator "
-                "or install the add-on in a writable user folder."
-            )
+            message += " | Access denied to the add-on folder. Run Blender as administrator or install the add-on in a writable user folder."
         if path:
             message += f" [Path: {path}]"
         return message
@@ -158,7 +153,7 @@ def _rebuild_enum():
     items = []
     for r in _state["releases"]:
         pre = " [pre]" if r["prerelease"] else ""
-        items.append((r["tag"], f'{r["tag"]}{pre}', r["name"] or ""))
+        items.append((r["tag"], f"{r['tag']}{pre}", r["name"] or ""))
     _enum_items = items or [("NONE", "(No releases)", "")]
     wm = bpy.context.window_manager
     if wm.gh_updater_tag not in {item[0] for item in _enum_items}:
@@ -166,10 +161,7 @@ def _rebuild_enum():
 
 
 def _latest_newer():
-    newer_releases = (
-        release for release in _state["releases"]
-        if _cmp_ver(release["version"], current_version()) > 0
-    )
+    newer_releases = (release for release in _state["releases"] if _cmp_ver(release["version"], current_version()) > 0)
     return max(newer_releases, key=lambda release: release["version"], default=None)
 
 
@@ -177,10 +169,7 @@ def _interval_elapsed(timestamp):
     if not timestamp:
         return True
     last_time = datetime.fromtimestamp(timestamp)
-    total_months = (
-        last_time.year * 12 + last_time.month - 1
-        + _settings["interval_months"]
-    )
+    total_months = last_time.year * 12 + last_time.month - 1 + _settings["interval_months"]
     year, month_index = divmod(total_months, 12)
     month = month_index + 1
     day = min(last_time.day, calendar.monthrange(year, month)[1])
@@ -305,26 +294,20 @@ def _fetch_worker(include_pre):
             if ver is None:
                 continue
             zip_asset = next(
-                (
-                    asset for asset in rel.get("assets", [])
-                    if asset["name"].lower().endswith(".zip")
-                ),
+                (asset for asset in rel.get("assets", []) if asset["name"].lower().endswith(".zip")),
                 None,
             )
-            browser_url = (
-                zip_asset.get("browser_download_url") if zip_asset else None
+            browser_url = zip_asset.get("browser_download_url") if zip_asset else None
+            download_url = browser_url or (f"https://github.com/{GITHUB_REPO}/archive/refs/tags/{urllib.parse.quote(rel['tag_name'], safe='')}.zip")
+            releases.append(
+                {
+                    "tag": rel["tag_name"],
+                    "version": ver,
+                    "url": download_url,
+                    "name": rel.get("name", ""),
+                    "prerelease": bool(rel.get("prerelease")),
+                }
             )
-            download_url = browser_url or (
-                f"https://github.com/{GITHUB_REPO}/archive/refs/tags/"
-                f"{urllib.parse.quote(rel['tag_name'], safe='')}.zip"
-            )
-            releases.append({
-                "tag": rel["tag_name"],
-                "version": ver,
-                "url": download_url,
-                "name": rel.get("name", ""),
-                "prerelease": bool(rel.get("prerelease")),
-            })
         releases.sort(key=lambda r: r["version"], reverse=True)
         _state["releases"] = releases
         _state["message"] = f"Found {len(releases)} releases"
@@ -389,29 +372,18 @@ def _replace_addon_tree(source):
                     os.replace(backup, ADDON_DIR)
                 except OSError as rollback_error:
                     preserve_backup = True
-                    cleanup_warning = (
-                        f"Could not restore the previous version. Backup: {backup} / "
-                        f"{_format_error(rollback_error)}"
-                    )
+                    cleanup_warning = f"Could not restore the previous version. Backup: {backup} / {_format_error(rollback_error)}"
             else:
                 preserve_backup = True
-                cleanup_warning = (
-                    f"Previous version backup kept: {backup}"
-                )
+                cleanup_warning = f"Previous version backup kept: {backup}"
         if not preserve_backup:
             try:
                 shutil.rmtree(staging_root)
             except OSError as cleanup_error:
                 if installed_new_addon:
-                    cleanup_warning = (
-                        f"Could not remove previous-version backup: "
-                        f"{staging_root} / {_format_error(cleanup_error)}"
-                    )
+                    cleanup_warning = f"Could not remove previous-version backup: {staging_root} / {_format_error(cleanup_error)}"
                 elif not cleanup_warning:
-                    cleanup_warning = (
-                        f"Could not remove temporary files: "
-                        f"{staging_root} / {_format_error(cleanup_error)}"
-                    )
+                    cleanup_warning = f"Could not remove temporary files: {staging_root} / {_format_error(cleanup_error)}"
     return cleanup_warning
 
 
@@ -440,7 +412,7 @@ def _install_worker(release):
         cleanup_warning = _replace_addon_tree(src)
 
         _state["show_restart_prompt"] = True
-        _state["message"] = f'Installed {release["tag"]}'
+        _state["message"] = f"Installed {release['tag']}"
         if cleanup_warning:
             _state["message"] += f" ({cleanup_warning})"
     except Exception as e:
@@ -457,9 +429,7 @@ def _start_fetch(notify_after_fetch=False, force_notify=False):
     _state["notify_after_fetch"] = notify_after_fetch
     _state["force_notify_after_fetch"] = force_notify
     _state["message"] = "Checking releases..."
-    threading.Thread(
-        target=_fetch_worker, args=(_settings["include_pre"],), daemon=True
-    ).start()
+    threading.Thread(target=_fetch_worker, args=(_settings["include_pre"],), daemon=True).start()
     bpy.app.timers.register(_poll, first_interval=0.3)
     return True
 
@@ -471,7 +441,7 @@ def _start_install(release, window=None):
     _state["notify_after_fetch"] = False
     _state["force_notify_after_fetch"] = False
     _state["prompt_window"] = window or bpy.context.window
-    _state["message"] = f'Downloading {release["tag"]}...'
+    _state["message"] = f"Downloading {release['tag']}..."
     threading.Thread(target=_install_worker, args=(release,), daemon=True).start()
     bpy.app.timers.register(_poll, first_interval=0.3)
     return True
@@ -499,8 +469,9 @@ class GHUPD_OT_install(bpy.types.Operator):
         if not rel:
             return {"CANCELLED"}
         return context.window_manager.invoke_confirm(
-            self, event,
-            message=f'Install {rel["tag"]} over v{_fmt(current_version())}?',
+            self,
+            event,
+            message=f"Install {rel['tag']} over v{_fmt(current_version())}?",
         )
 
     def execute(self, context):
@@ -521,8 +492,7 @@ class GHUPD_OT_popup(bpy.types.Operator):
             return {"CANCELLED"}
         wm = context.window_manager
         try:
-            return wm.invoke_props_dialog(
-                self, width=340, title="Update Available", confirm_text="Install")
+            return wm.invoke_props_dialog(self, width=340, title="Update Available", confirm_text="Install")
         except TypeError:  # 旧Blenderではconfirm_text非対応
             return wm.invoke_props_dialog(self, width=340)
 
@@ -530,7 +500,7 @@ class GHUPD_OT_popup(bpy.types.Operator):
         rel = _latest_newer()
         col = self.layout.column()
         pre = " (Pre-release)" if rel["prerelease"] else ""
-        col.label(text=f'Available: {rel["tag"]}{pre}')
+        col.label(text=f"Available: {rel['tag']}{pre}")
         col.label(text=f"Installed: v{_fmt(current_version())}")
 
     def execute(self, context):
@@ -549,9 +519,7 @@ class GHUPD_OT_restart_prompt(bpy.types.Operator):
         try:
             return context.window_manager.invoke_popup(self, width=360)
         except (RuntimeError, TypeError):
-            return context.window_manager.invoke_props_dialog(
-                self, width=360, title="Update Installed"
-            )
+            return context.window_manager.invoke_props_dialog(self, width=360, title="Update Installed")
 
     def draw(self, context):
         self.layout.label(text="Restart Blender to apply the update.")
@@ -605,6 +573,7 @@ def draw(layout, context):
     update_button.enabled = not _state["busy"] and bool(_state["releases"])
     update_button.operator("ghupd.install", text="Update", icon="IMPORT")
 
+
 # 登録と解除
 classes = (
     GHUPD_OT_check,
@@ -618,25 +587,26 @@ def register():
     _load_settings()
 
     g, s = _accessors("include_pre", bool)
-    bpy.types.WindowManager.gh_updater_pre = BoolProperty(
-        name="Include Pre-releases", get=g, set=s)
+    bpy.types.WindowManager.gh_updater_pre = BoolProperty(name="Include Pre-releases", get=g, set=s)
     g, s = _accessors("interval_months", int)
     bpy.types.WindowManager.gh_updater_months = IntProperty(
-        name="Months", description="Months between update notifications", min=0, max=120, get=g, set=s)
+        name="Months", description="Months between update notifications", min=0, max=120, get=g, set=s
+    )
     g, s = _accessors("interval_days", int)
-    bpy.types.WindowManager.gh_updater_days = IntProperty(
-        name="Days", description="Days between update notifications", min=0, max=365, get=g, set=s)
+    bpy.types.WindowManager.gh_updater_days = IntProperty(name="Days", description="Days between update notifications", min=0, max=365, get=g, set=s)
     g, s = _accessors("interval_hours", int)
     bpy.types.WindowManager.gh_updater_hours = IntProperty(
-        name="Hours", description="Hours between update notifications", min=0, max=23, get=g, set=s)
+        name="Hours", description="Hours between update notifications", min=0, max=23, get=g, set=s
+    )
     g, s = _accessors("interval_minutes", int)
     bpy.types.WindowManager.gh_updater_minutes = IntProperty(
-        name="Minutes", description="Minutes between update notifications", min=0, max=59, get=g, set=s)
+        name="Minutes", description="Minutes between update notifications", min=0, max=59, get=g, set=s
+    )
     g, s = _accessors("interval_seconds", int)
     bpy.types.WindowManager.gh_updater_seconds = IntProperty(
-        name="Seconds", description="Seconds between update notifications", min=0, max=59, get=g, set=s)
-    bpy.types.WindowManager.gh_updater_tag = EnumProperty(
-        name="Version", items=_enum_cb)
+        name="Seconds", description="Seconds between update notifications", min=0, max=59, get=g, set=s
+    )
+    bpy.types.WindowManager.gh_updater_tag = EnumProperty(name="Version", items=_enum_cb)
 
     for c in classes:
         bpy.utils.register_class(c)
