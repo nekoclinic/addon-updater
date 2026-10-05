@@ -12,11 +12,11 @@
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 bl_info = {
-    "name": "Blender Updater",
+    "name": "Addon Updater",
     "author": "wawawa",
     "description": "",
     "blender": (2, 80, 0),
-    "version": (0, 0, 3),
+    "version": (0, 0, 4),
     "location": "",
     "warning": "",
     "category": "Generic",
@@ -31,26 +31,10 @@ class BUPreferences(bpy.types.AddonPreferences):
     def draw(self, context):
         updater.draw(self.layout, context)
 
-class BU_PT_main(bpy.types.Panel):
-    bl_idname      = "BU_PT_main"
-    bl_label       = "blender updater"
-    bl_category    = "blender updater"
-    bl_space_type  = "VIEW_3D"
-    bl_region_type = "UI"
-    bl_context     = ""
-    bl_order       = 0
-
-    def draw(self, context):
-        layout = self.layout
-        layout.label(text="blender updater")
-        layout.label(text=f"Current version: {'.'.join(map(str, updater.current_version()))}")
-
 def register():
     updater.register()
     bpy.utils.register_class(BUPreferences)
-    bpy.utils.register_class(BU_PT_main)
 
 def unregister():
     updater.unregister()
     bpy.utils.unregister_class(BUPreferences)
-    bpy.utils.unregister_class(BU_PT_main)
