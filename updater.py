@@ -1,4 +1,4 @@
-"""GitHub Releasesを使ったBlenderアドオン更新モジュール。"""
+# GitHub Releasesを使うBlenderアドオン更新機能。
 
 import calendar
 import json
@@ -18,39 +18,38 @@ from datetime import datetime, timedelta
 import bpy
 from bpy.props import BoolProperty, EnumProperty, IntProperty
 
-# ---------------------------------------------------------------- 設定
+# 設定
 GITHUB_REPO = "nekoclinic/addon-updater"  # リポジトリ
 
 ADDON_DIR = os.path.dirname(os.path.abspath(__file__))
 PKG = __package__.split(".")[0] if __package__ else os.path.basename(ADDON_DIR)
-ENV_FILE = os.path.join(ADDON_DIR, ".env")  # 非公開用トークン
 
 _DEFAULTS = {
-    "include_pre": True,        # preを含める
+    "include_pre": True,
     "interval_months": 0,
     "interval_days": 7,
     "interval_hours": 0,
     "interval_minutes": 0,
     "interval_seconds": 0,
-    "last_check": 0.0,          # 確認時刻
-    "last_notified": 0.0,       # 通知時刻
+    "last_check": 0.0,
+    "last_notified": 0.0,
 }
 _settings = dict(_DEFAULTS)
 
-# ---------------------------------------------------------------- 状態
+# 状態
 _state = {
     "busy": False,
     "notify_after_fetch": False,
     "show_restart_prompt": False,
     "prompt_window": None,
     "message": "",
-    "releases": [],      # リリース
-    "need_restart": False,
+    "releases": [],
+    "last_check_pending": False,
 }
 _enum_items = [("NONE", "(Not checked)", "")]
 
 
-# ---------------------------------------------------------------- 設定保存
+# 設定の保存
 def _settings_path():
     return os.path.join(bpy.utils.user_resource("CONFIG"), f"{PKG}_updater.json")
 
@@ -86,24 +85,7 @@ def _accessors(key, cast):
     return getter, setter
 
 
-# ---------------------------------------------------------------- 認証
-def _token():
-    """直下の.env、次に環境変数からトークンを読む。"""
-    try:
-        with open(ENV_FILE, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                if k.strip() == "GITHUB_TOKEN":
-                    return v.strip().strip("'\"")
-    except OSError:
-        pass
-    return os.environ.get("GITHUB_TOKEN", "")
-
-
-# ---------------------------------------------------------------- 共通
+# 共通処理
 def current_version():
     mod = sys.modules.get(PKG)
     info = getattr(mod, "bl_info", {}) or {}
@@ -129,15 +111,11 @@ def _cmp_ver(a, b):
 
 
 def _headers():
-    h = {
+    return {
         "User-Agent": f"{PKG}-updater",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    token = _token()
-    if token:
-        h["Authorization"] = f"Bearer {token}"
-    return h
 
 
 def _format_error(error):
@@ -163,23 +141,6 @@ def _format_error(error):
         if detail:
             message += f" ({detail})"
         message += f": {error.url}"
-        if (
-            error.code == 404
-            and "api.github.com/repos/" in error.url
-            and GITHUB_REPO.lower() in error.url.lower()
-        ):
-            if _token():
-                message += (
-                    " | GITHUB_TOKEN is set, but the repository is inaccessible. "
-                    "For a fine-grained token, grant repository access and Contents: Read. "
-                    "For a classic token, grant the repo scope. Also check expiration "
-                    "and organization approval."
-                )
-            else:
-                message += (
-                    " | GITHUB_TOKEN is required for this private repository. "
-                    "Set it in the add-on's .env file."
-                )
         return message
     return str(error)
 
@@ -199,12 +160,11 @@ def _rebuild_enum():
         items.append((r["tag"], f'{r["tag"]}{pre}', r["name"] or ""))
     _enum_items = items or [("NONE", "(No releases)", "")]
     wm = bpy.context.window_manager
-    if wm.gh_updater_tag not in [i[0] for i in _enum_items]:
+    if wm.gh_updater_tag not in {item[0] for item in _enum_items}:
         wm.gh_updater_tag = _enum_items[0][0]
 
 
 def _latest_newer():
-    """新しいリリースを返す。"""
     rels = _state["releases"]
     if rels and _cmp_ver(rels[0]["version"], current_version()) > 0:
         return rels[0]
@@ -212,7 +172,6 @@ def _latest_newer():
 
 
 def _maybe_notify():
-    """通知間隔を過ぎていれば通知する。"""
     if not _latest_newer():
         return
     if _settings["last_notified"]:
@@ -246,6 +205,10 @@ def _maybe_notify():
 
 
 def _poll():
+    if _state["last_check_pending"]:
+        _state["last_check_pending"] = False
+        _settings["last_check"] = time.time()
+        _save_settings()
     if _state["busy"]:
         return 0.3
     _rebuild_enum()
@@ -305,7 +268,7 @@ def _enum_cb(self, context):
     return _enum_items
 
 
-# ---------------------------------------------------------------- 通信
+# GitHub通信
 def _fetch_worker(include_pre):
     try:
         url = f"https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=50"
@@ -332,30 +295,21 @@ def _fetch_worker(include_pre):
             browser_url = (
                 zip_asset.get("browser_download_url") if zip_asset else None
             )
-            asset_api_url = zip_asset.get("url") if zip_asset else None
-            download_url = (
-                (asset_api_url if _token() else browser_url)
-                or browser_url
-                or asset_api_url
-            ) or (
+            download_url = browser_url or (
                 f"https://github.com/{GITHUB_REPO}/archive/refs/tags/"
                 f"{urllib.parse.quote(rel['tag_name'], safe='')}.zip"
             )
-            if not download_url:
-                continue
             releases.append({
                 "tag": rel["tag_name"],
                 "version": ver,
                 "url": download_url,
-                "browser_url": browser_url,
                 "name": rel.get("name", ""),
                 "prerelease": bool(rel.get("prerelease")),
             })
         releases.sort(key=lambda r: r["version"], reverse=True)
         _state["releases"] = releases
         _state["message"] = f"Found {len(releases)} releases"
-        _settings["last_check"] = time.time()
-        _save_settings()
+        _state["last_check_pending"] = True
     except Exception as e:
         _state["message"] = f"Check failed: {_format_error(e)}"
         _state["notify_after_fetch"] = False
@@ -389,11 +343,8 @@ def _replace_addon_tree(source):
         shutil.copytree(
             source,
             staged_addon,
-            ignore=shutil.ignore_patterns(".env", "__pycache__"),
+            ignore=shutil.ignore_patterns("__pycache__"),
         )
-        env_path = os.path.join(ADDON_DIR, ".env")
-        if os.path.isfile(env_path):
-            shutil.copy2(env_path, os.path.join(staged_addon, ".env"))
 
         os.replace(ADDON_DIR, backup)
         moved_old_addon = True
@@ -447,25 +398,8 @@ def _replace_addon_tree(source):
 def _download_release(release, zip_path):
     download_url = release["url"]
     headers = {"User-Agent": f"{PKG}-updater"}
-    if _token():
-        headers["Authorization"] = _headers()["Authorization"]
-    if "api.github.com" in download_url:
-        headers["Accept"] = "application/octet-stream"
-        headers["X-GitHub-Api-Version"] = "2022-11-28"
     req = urllib.request.Request(download_url, headers=headers)
-    try:
-        response = urllib.request.urlopen(req, timeout=60)
-    except urllib.error.HTTPError as e:
-        fallback_url = release.get("browser_url")
-        if e.code != 415 or not fallback_url or fallback_url == download_url:
-            raise
-        e.close()
-        response = urllib.request.urlopen(
-            urllib.request.Request(
-                fallback_url, headers={"User-Agent": f"{PKG}-updater"}
-            ),
-            timeout=60,
-        )
+    response = urllib.request.urlopen(req, timeout=60)
     with response, open(zip_path, "wb") as f:
         shutil.copyfileobj(response, f)
 
@@ -473,11 +407,9 @@ def _download_release(release, zip_path):
 def _install_worker(release):
     tmp = tempfile.mkdtemp(prefix="gh_updater_")
     try:
-        # ZIPを取得
         zip_path = os.path.join(tmp, "pkg.zip")
         _download_release(release, zip_path)
 
-        # ZIPを展開
         ext = os.path.join(tmp, "extract")
         with zipfile.ZipFile(zip_path) as z:
             z.extractall(ext)
@@ -487,7 +419,6 @@ def _install_worker(release):
 
         cleanup_warning = _replace_addon_tree(src)
 
-        _state["need_restart"] = True
         _state["show_restart_prompt"] = True
         _state["message"] = f'Installed {release["tag"]}'
         if cleanup_warning:
@@ -524,7 +455,7 @@ def _start_install(release, window=None):
     return True
 
 
-# ---------------------------------------------------------------- UI操作
+# UIオペレーター
 class GHUPD_OT_check(bpy.types.Operator):
     bl_idname = "ghupd.check"
     bl_label = "Check for Updates"
@@ -558,9 +489,9 @@ class GHUPD_OT_install(bpy.types.Operator):
 
 
 class GHUPD_OT_popup(bpy.types.Operator):
-    """更新通知を表示する。"""
     bl_idname = "ghupd.popup"
     bl_label = "Update Available"
+    bl_description = "Show the update notification."
     bl_options = {"INTERNAL"}
 
     def invoke(self, context, event):
@@ -568,7 +499,7 @@ class GHUPD_OT_popup(bpy.types.Operator):
         try:
             return wm.invoke_props_dialog(
                 self, width=340, title="Update Available", confirm_text="Install")
-        except TypeError:  # 古いBlender用
+        except TypeError:  # 旧Blenderではconfirm_text非対応
             return wm.invoke_props_dialog(self, width=340)
 
     def draw(self, context):
@@ -612,19 +543,27 @@ class GHUPD_OT_restart_prompt(bpy.types.Operator):
         return {"CANCELLED"}
 
 
-# ---------------------------------------------------------------- UI
+# UI
 def draw(layout, context):
     wm = context.window_manager
     layout.use_property_split = False
     layout.use_property_decorate = False
 
-    layout.label(text=f"Installed: v{_fmt(current_version())}", icon="PLUGIN")
+    layout.label(text="Updater Settings")
     layout.prop(wm, "gh_updater_pre", text="Include Pre-releases")
+
+    interval_row = layout.row(align=True)
+    interval_row.alignment = "RIGHT"
+    interval_row.prop(wm, "gh_updater_months", text="Mo")
+    interval_row.prop(wm, "gh_updater_days", text="D")
+    interval_row.prop(wm, "gh_updater_hours", text="H")
+    interval_row.prop(wm, "gh_updater_minutes", text="Min")
+    interval_row.prop(wm, "gh_updater_seconds", text="Sec")
 
     controls = layout.row(align=True)
     check_slot = controls.row(align=True)
-    check_slot.scale_x = 2
-    check_slot.scale_y = 3.25
+    check_slot.scale_x = 0.95
+    check_slot.scale_y = 2.5
     check_slot.enabled = not _state["busy"]
     check_text = "Check"
     last = _settings["last_check"]
@@ -634,13 +573,6 @@ def draw(layout, context):
     check_slot.operator("ghupd.check", text=check_text, icon="FILE_REFRESH")
 
     side_controls = controls.column(align=True)
-    interval_row = side_controls.row(align=True)
-    interval_row.prop(wm, "gh_updater_months", text="Mo")
-    interval_row.prop(wm, "gh_updater_days", text="D")
-    interval_row.prop(wm, "gh_updater_hours", text="H")
-    interval_row.prop(wm, "gh_updater_minutes", text="Min")
-    interval_row.prop(wm, "gh_updater_seconds", text="Sec")
-
     update_controls = side_controls.column(align=True)
     update_controls.enabled = not _state["busy"]
     if _state["releases"]:
@@ -648,21 +580,12 @@ def draw(layout, context):
     else:
         update_controls.label(text="Version", icon="DOWNARROW_HLT")
     update_button = update_controls.row(align=True)
-    update_button.scale_y = 1.25
+    update_button.scale_y = 1.5
     update_button.enabled = not _state["busy"] and bool(_state["releases"])
     update_button.operator("ghupd.install", text="Update", icon="IMPORT")
 
-    # if _state["busy"]:
-    #     layout.label(text=_state["message"], icon="TIME")
-    # elif _state["message"]:
-    #     layout.label(text=_state["message"], icon="INFO")
-
-    # if _state["need_restart"]:
-    #     layout.label(text="Restart Blender to apply the update.", icon="ERROR")
-
-
-# ---------------------------------------------------------------- 登録
-_classes = (
+# 登録と解除
+classes = (
     GHUPD_OT_check,
     GHUPD_OT_install,
     GHUPD_OT_popup,
@@ -694,12 +617,12 @@ def register():
     bpy.types.WindowManager.gh_updater_tag = EnumProperty(
         name="Version", items=_enum_cb)
 
-    for c in _classes:
+    for c in classes:
         bpy.utils.register_class(c)
 
 
 def unregister():
-    for c in reversed(_classes):
+    for c in reversed(classes):
         bpy.utils.unregister_class(c)
     del bpy.types.WindowManager.gh_updater_tag
     del bpy.types.WindowManager.gh_updater_seconds

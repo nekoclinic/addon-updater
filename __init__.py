@@ -16,7 +16,7 @@ bl_info = {
     "author": "wawawa",
     "description": "",
     "blender": (2, 80, 0),
-    "version": (0, 0, 5),
+    "version": (0, 0, 6),
     "location": "",
     "warning": "",
     "category": "Generic",
@@ -26,7 +26,7 @@ import bpy
 from . import updater
 
 class BUPreferences(bpy.types.AddonPreferences):
-    bl_idname = __package__.split(".")[0]   # アドオンのルートパッケージ名
+    bl_idname = __package__
 
     def draw(self, context):
         updater.draw(self.layout, context)
