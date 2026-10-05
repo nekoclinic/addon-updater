@@ -40,6 +40,7 @@ _settings = dict(_DEFAULTS)
 _state = {
     "busy": False,
     "notify_after_fetch": False,
+    "force_notify_after_fetch": False,
     "show_restart_prompt": False,
     "prompt_window": None,
     "message": "",
@@ -165,33 +166,39 @@ def _rebuild_enum():
 
 
 def _latest_newer():
-    rels = _state["releases"]
-    if rels and _cmp_ver(rels[0]["version"], current_version()) > 0:
-        return rels[0]
-    return None
+    newer_releases = (
+        release for release in _state["releases"]
+        if _cmp_ver(release["version"], current_version()) > 0
+    )
+    return max(newer_releases, key=lambda release: release["version"], default=None)
 
 
-def _maybe_notify():
+def _interval_elapsed(timestamp):
+    if not timestamp:
+        return True
+    last_time = datetime.fromtimestamp(timestamp)
+    total_months = (
+        last_time.year * 12 + last_time.month - 1
+        + _settings["interval_months"]
+    )
+    year, month_index = divmod(total_months, 12)
+    month = month_index + 1
+    day = min(last_time.day, calendar.monthrange(year, month)[1])
+    due_at = last_time.replace(year=year, month=month, day=day)
+    due_at += timedelta(
+        days=_settings["interval_days"],
+        hours=_settings["interval_hours"],
+        minutes=_settings["interval_minutes"],
+        seconds=_settings["interval_seconds"],
+    )
+    return datetime.now() >= due_at
+
+
+def _maybe_notify(force=False):
     if not _latest_newer():
         return
-    if _settings["last_notified"]:
-        last_notified = datetime.fromtimestamp(_settings["last_notified"])
-        total_months = (
-            last_notified.year * 12 + last_notified.month - 1
-            + _settings["interval_months"]
-        )
-        year, month_index = divmod(total_months, 12)
-        month = month_index + 1
-        day = min(last_notified.day, calendar.monthrange(year, month)[1])
-        due_at = last_notified.replace(year=year, month=month, day=day)
-        due_at += timedelta(
-            days=_settings["interval_days"],
-            hours=_settings["interval_hours"],
-            minutes=_settings["interval_minutes"],
-            seconds=_settings["interval_seconds"],
-        )
-        if datetime.now() < due_at:
-            return
+    if not force and not _interval_elapsed(_settings["last_notified"]):
+        return
     wm = bpy.context.window_manager
     if not wm.windows:
         return
@@ -260,7 +267,19 @@ def _poll():
             _state["show_restart_prompt"] = False
     if _state["notify_after_fetch"]:
         _state["notify_after_fetch"] = False
-        _maybe_notify()
+        force_notify = _state["force_notify_after_fetch"]
+        _state["force_notify_after_fetch"] = False
+        _maybe_notify(force=force_notify)
+    return None
+
+
+def _startup_check():
+    if bpy.app.background:
+        return None
+    if _state["busy"]:
+        return 1.0
+    if _interval_elapsed(_settings["last_check"]):
+        _start_fetch(notify_after_fetch=True, force_notify=True)
     return None
 
 
@@ -313,6 +332,7 @@ def _fetch_worker(include_pre):
     except Exception as e:
         _state["message"] = f"Check failed: {_format_error(e)}"
         _state["notify_after_fetch"] = False
+        _state["force_notify_after_fetch"] = False
     finally:
         _state["busy"] = False
 
@@ -430,11 +450,12 @@ def _install_worker(release):
         _state["busy"] = False
 
 
-def _start_fetch(notify_after_fetch=False):
+def _start_fetch(notify_after_fetch=False, force_notify=False):
     if _state["busy"]:
         return False
     _state["busy"] = True
     _state["notify_after_fetch"] = notify_after_fetch
+    _state["force_notify_after_fetch"] = force_notify
     _state["message"] = "Checking releases..."
     threading.Thread(
         target=_fetch_worker, args=(_settings["include_pre"],), daemon=True
@@ -448,6 +469,7 @@ def _start_install(release, window=None):
         return False
     _state["busy"] = True
     _state["notify_after_fetch"] = False
+    _state["force_notify_after_fetch"] = False
     _state["prompt_window"] = window or bpy.context.window
     _state["message"] = f'Downloading {release["tag"]}...'
     threading.Thread(target=_install_worker, args=(release,), daemon=True).start()
@@ -495,6 +517,8 @@ class GHUPD_OT_popup(bpy.types.Operator):
     bl_options = {"INTERNAL"}
 
     def invoke(self, context, event):
+        if not _latest_newer():
+            return {"CANCELLED"}
         wm = context.window_manager
         try:
             return wm.invoke_props_dialog(
@@ -505,9 +529,6 @@ class GHUPD_OT_popup(bpy.types.Operator):
     def draw(self, context):
         rel = _latest_newer()
         col = self.layout.column()
-        if not rel:
-            col.label(text="You're up to date")
-            return
         pre = " (Pre-release)" if rel["prerelease"] else ""
         col.label(text=f'Available: {rel["tag"]}{pre}')
         col.label(text=f"Installed: v{_fmt(current_version())}")
@@ -554,11 +575,11 @@ def draw(layout, context):
 
     interval_row = layout.row(align=True)
     interval_row.alignment = "RIGHT"
-    interval_row.prop(wm, "gh_updater_months", text="Mo")
-    interval_row.prop(wm, "gh_updater_days", text="D")
-    interval_row.prop(wm, "gh_updater_hours", text="H")
-    interval_row.prop(wm, "gh_updater_minutes", text="Min")
-    interval_row.prop(wm, "gh_updater_seconds", text="Sec")
+    interval_row.prop(wm, "gh_updater_months", text="Months")
+    interval_row.prop(wm, "gh_updater_days", text="Days")
+    interval_row.prop(wm, "gh_updater_hours", text="Hours")
+    interval_row.prop(wm, "gh_updater_minutes", text="Minutes")
+    interval_row.prop(wm, "gh_updater_seconds", text="Seconds")
 
     controls = layout.row(align=True)
     check_slot = controls.row(align=True)
@@ -619,9 +640,12 @@ def register():
 
     for c in classes:
         bpy.utils.register_class(c)
+    bpy.app.timers.register(_startup_check, first_interval=0.0)
 
 
 def unregister():
+    if bpy.app.timers.is_registered(_startup_check):
+        bpy.app.timers.unregister(_startup_check)
     for c in reversed(classes):
         bpy.utils.unregister_class(c)
     del bpy.types.WindowManager.gh_updater_tag
