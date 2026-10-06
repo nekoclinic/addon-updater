@@ -1,60 +1,85 @@
-# Addon Updater
+# updater.py
 
-GitHub ReleasesからBlenderアドオンの更新を確認し、Preferencesから選択したバージョンをインストールできるアドオンです。
+GitHub Releases から Blender アドオンを更新・ダウングレードするモジュールです。アドオンのパッケージ内に置いて使います。
 
-## 主な機能
+## 機能
 
-- 設定された公開GitHubリポジトリからリリースを取得
-- プレリリースを含めるかどうかを設定
-- 前回の確認から指定した間隔が経過している場合、Blender起動時に自動確認
-- インストール中のバージョンより新しいリリースがある場合に通知
-- リリースを選択してアドオンを更新
-- 更新後にBlenderの再起動を案内
+- 任意のバージョンを選んでインストール(ダウングレードも可)
+- 設定した間隔(月・日・時・分・秒)で更新を確認し、新しいバージョンがあればカーソル位置にポップアップを表示
+- プレリリースを含めるかを切り替え(初期値: 含める)
+- インストール失敗時は元のバージョンに自動で戻す
+- インストール後に再起動ポップアップを表示
 
-## 動作環境
+## 動作条件
 
-- Blender 2.80以降
-- GitHubに接続できるインターネット環境
+- Blender 5.2 (Python 3.10 以上)
+- アドオンの `__init__.py` に `bl_info` があること
+- Extensions 形式 (`blender_manifest.toml`) のアドオンは非対応
 
-Python標準ライブラリとBlenderの`bpy` APIを使用します。追加のPythonパッケージは不要です。
+## 組み込み方
 
-## インストール方法
+1. `updater.py` をアドオンのパッケージ内に置きます。
+2. `__init__.py` から登録し、Preferences の `draw` で呼び出します。
 
-1. このリポジトリをダウンロードまたはクローンします。
-2. Blenderの **Preferences** を開き、**Add-ons** を選択します。
-3. **Install from Disk...** を選び、アドオンのPythonファイル、またはアドオンフォルダーを含むZIPファイルを指定します。
-4. **Addon Updater** を有効にします。
+```python
+import bpy
+from . import updater
 
-自動更新を使用するには、Blenderからアドオンのインストール先フォルダーに書き込みできる必要があります。
+bl_info = {
+    "name": "My Addon",
+    "version": (1, 0, 0),
+    "blender": (5, 2, 0),
+}
+
+
+class MyPreferences(bpy.types.AddonPreferences):
+    bl_idname = __package__
+
+    def draw(self, context):
+        updater.draw(self.layout, context)
+
+
+def register():
+    updater.register(repo="owner/name")
+    bpy.utils.register_class(MyPreferences)
+
+
+def unregister():
+    bpy.utils.unregister_class(MyPreferences)
+    updater.unregister()
+```
+
+`repo` を省略すると、`updater.py` 先頭の `GITHUB_REPO` を使います。
+
+複数のアドオンに入れても、`bl_idname` とプロパティ名はパッケージ名から作られるので衝突しません。ただしパッケージ名が数字で始まると登録できません。
+
+## リリースの作り方
+
+- タグは `v1.1.0` または `1.1.0` の形式にします。バージョンとして読めないタグは無視されます。
+- ZIP をアセットとして添付します。添付がなければ、タグのソースアーカイブを使います。
+- ZIP の中に、`bl_info` を含む `__init__.py` があるフォルダが必要です。
+- 更新の判定は `bl_info["version"]` とタグの比較です。リリースのたびに `bl_info` のバージョンも上げてください。上げ忘れると、更新通知が出続けます。
+- ドラフトのリリースは無視されます。
 
 ## 使い方
 
-アドオンのPreferencesから更新確認を設定できます。
+Preferences の画面に次の項目が出ます。
 
-- **Include Pre-releases**：プレリリースをバージョン一覧に含めます。
-- **Months / Days / Hours / Minutes / Seconds**：起動時に自動確認する間隔を指定します。前回の更新確認が成功した時刻を基準にします。
-- **Check**：GitHubを確認し、バージョン一覧を更新します。
-- **Version**：インストールするリリースを選択します。
-- **Update**：選択したリリースをダウンロードしてインストールします。
+| 項目 | 内容 |
+| --- | --- |
+| Include Pre-releases | プレリリースを一覧に含める |
+| Months / Days / Hours / Minutes / Seconds | 更新を確認する間隔 |
+| Check | 今すぐリリース一覧を取得する |
+| バージョン選択 + Install | 選んだバージョンをインストールする |
 
-起動時の確認間隔を過ぎており、インストール中のバージョンより新しいリリースが見つかった場合、更新通知を表示します。手動確認時も、通知間隔の条件を満たす場合に通知を表示します。新しいリリースがない場合は通知を表示しません。
+起動時に、前回の確認から設定した間隔が経っていれば自動で確認します。新しいバージョンがあればポップアップが出るので、`Install` を押します。インストールが終わると再起動を促すポップアップが出ます。
 
-更新をインストールした後は、新しいファイルを読み込むためにBlenderを再起動してください。終了前に作業内容を保存してください。
+## 設定ファイル
 
-## 更新元
+設定と最終確認時刻は、Blender のユーザー設定フォルダ (`CONFIG`) に `{パッケージ名}_updater.json` として保存されます。
 
-リリースは、[`updater.py`](updater.py)で指定されている次の公開リポジトリから取得します。
+## 注意
 
-[`nekoclinic/addon-updater`](https://github.com/nekoclinic/addon-updater)
-
-非公開リポジトリおよびトークン認証には対応していません。
-
-## トラブルシューティング
-
-- **バージョン一覧が表示されない**：インターネット接続を確認し、リポジトリにバージョンタグ付きのリリースが公開されていることを確認してください。
-- **更新に失敗する**：Blenderからアドオンのインストール先に書き込みできることを確認してください。ファイルが使用中の場合は、Blenderを再起動してから再度お試しください。
-- **更新後も新しいバージョンが反映されない**：更新後の案内に従ってBlenderを再起動してください。
-
-## ライセンス
-
-このプロジェクトはGNU General Public License version 3以降の条件で配布されています。詳細は[LICENSE](LICENSE)を参照してください。
+- ポップアップは開いたウィンドウの外には出られません。
+- バックグラウンドモード (`bpy.app.background`) では、起動時の自動確認をしません。
+- 失敗したときのメッセージは内部に保持しますが、画面には出しません。原因を調べるときは、System Console のエラー出力を確認してください。
